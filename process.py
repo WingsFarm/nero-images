@@ -1,29 +1,65 @@
-"""Download Nero product images, replace background with pure white, square-pad, save to out/."""
-import json, os, io, sys, urllib.request
-from PIL import Image
-from rembg import remove, new_session
+"""Nero product images -> pure white background, square, centered.
 
-session = new_session("isnet-general-use")
+Two methods:
+- "whiten": for studio shots on an even light background. Divides the image by the
+  background brightness so the backdrop becomes exactly 255 while the jewelry keeps
+  its full contrast (no cut-out, so thin or out-of-focus chains don't fade).
+- "cutout": AI background removal (rembg) for photos whose background isn't even.
+"""
+import json, os, io, sys, urllib.request
+import numpy as np
+from PIL import Image
+
+OUT = os.environ.get("OUT_DIR", "out")
 src = json.load(open("sources.json"))
-only = sys.argv[1:]  # optional filename filters for a sample run
-os.makedirs("out", exist_ok=True)
+only = sys.argv[1:]
+os.makedirs(OUT, exist_ok=True)
+_session = None
+
+
+def border_stats(a):
+    b = np.concatenate([a[:20].reshape(-1, 3), a[-20:].reshape(-1, 3),
+                        a[:, :20].reshape(-1, 3), a[:, -20:].reshape(-1, 3)])
+    return b.mean(axis=0), b.std(axis=0).mean()
+
+
+def whiten(img):
+    a = np.asarray(img).astype(np.float32)
+    bg, _ = border_stats(a)
+    out = np.clip(a * (255.0 / np.maximum(bg, 1.0)), 0, 255)
+    out[out.min(axis=2) >= 247] = 255  # flatten residual backdrop noise to pure white
+    out = Image.fromarray(out.astype(np.uint8))
+    mask = Image.fromarray(((np.asarray(out).min(axis=2) < 245) * 255).astype(np.uint8))
+    return out, mask.getbbox()
+
+
+def cutout(img):
+    global _session
+    from rembg import remove, new_session
+    _session = _session or new_session("isnet-general-use")
+    cut = remove(img, session=_session)
+    bbox = cut.getchannel("A").point(lambda v: 255 if v > 8 else 0).getbbox()
+    white = Image.new("RGB", cut.size, (255, 255, 255))
+    white.paste(cut, (0, 0), cut)
+    return white, bbox
+
+
 for url, name in src:
     if only and not any(o in name for o in only):
         continue
-    dst = os.path.join("out", name.rsplit(".", 1)[0] + ".jpg")
+    dst = os.path.join(OUT, name.rsplit(".", 1)[0] + ".jpg")
     if os.path.exists(dst):
         continue
-    raw = urllib.request.urlopen(url, timeout=60).read()
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    cut = remove(img, session=session, alpha_matting=True,
-                 alpha_matting_foreground_threshold=240,
-                 alpha_matting_background_threshold=10)
-    bbox = cut.getchannel("A").point(lambda a: 255 if a > 8 else 0).getbbox()
+    img = Image.open(io.BytesIO(urllib.request.urlopen(url, timeout=60).read())).convert("RGB")
+    bg, noise = border_stats(np.asarray(img).astype(np.float32))
+    method = "whiten" if bg.min() > 200 and noise < 6 else "cutout"
+    im, bbox = (whiten if method == "whiten" else cutout)(img)
     if bbox:
-        cut = cut.crop(bbox)
-    side = int(max(cut.size) * 1.15)
+        im = im.crop(bbox)
+    side = int(max(im.size) * 1.15)
     canvas = Image.new("RGB", (side, side), (255, 255, 255))
-    canvas.paste(cut, ((side - cut.width) // 2, (side - cut.height) // 2), cut)
-    canvas = canvas.resize((1200, 1200), Image.LANCZOS) if side > 1200 else canvas
+    canvas.paste(im, ((side - im.width) // 2, (side - im.height) // 2))
+    if side != 1200:
+        canvas = canvas.resize((1200, 1200), Image.LANCZOS)
     canvas.save(dst, "JPEG", quality=92)
-    print("ok", name)
+    print(method, f"bg={bg.round()} noise={noise:.1f}", name)
